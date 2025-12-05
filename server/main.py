@@ -3,7 +3,7 @@ sys.modules["sqlite3"] = pysqlite3
 import chromadb
 import os
 
-from fastapi import FastAPI,UploadFile,File,Form,Request,HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
@@ -14,68 +14,103 @@ from logger import logger
 
 from config import PERSIST_DIR, EMBED_MODEL, COLLECTION_NAME
 
+# Import these at startup
+from langchain_chroma import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
 client = chromadb.PersistentClient(path=PERSIST_DIR)
-os.makedirs(PERSIST_DIR, exist_ok=True) # Ensure the folder exists
+os.makedirs(PERSIST_DIR, exist_ok=True)
 
-app=FastAPI(title='chatbot')
+app = FastAPI(title='chatbot')
 
+# Initialize embeddings and vectorstore at startup
+embeddings = None
+vectorstore = None
+chain = None
+
+@app.on_event("startup")
+async def startup_event():
+    global embeddings, vectorstore, chain
+    logger.info("Initializing embeddings model...")
+    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+    logger.info("Embeddings model loaded")
+    
+    logger.info("Initializing vectorstore...")
+    vectorstore = Chroma(
+        persist_directory=PERSIST_DIR,
+        embedding_function=embeddings,
+        collection_name=COLLECTION_NAME
+    )
+    logger.info("Vectorstore initialized")
+    
+    # Initialize chain (will be recreated after uploads)
+    chain = get_llm_chain(vectorstore)
+    logger.info("LLM chain ready")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
 )
 
 @app.middleware("http")
-async def catch_exception_middleware(request:Request, call_next):
+async def catch_exception_middleware(request: Request, call_next):
     try:
         return await call_next(request)
     except Exception as exc:
         logger.exception("Exception")
-        return JSONResponse(status_code=500,content={"error":str(exc)})
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+@app.get("/")
+def health_check():
+    return {"status": "healthy", "vectorstore_initialized": vectorstore is not None}
 
 @app.post("/upload_pdfs")
-async def uploaded_pdfs(files:List[UploadFile]=File(...)):
+async def uploaded_pdfs(files: List[UploadFile] = File(...)):
+    global vectorstore, chain
     try:
-        logger.info(f"received {len(files)} files")
+        logger.info(f"Received {len(files)} files")
         load_vectorstore(files)
-        logger.info("documenrts added to chroma")
-        return {"messafe":"files proceed and vectorstore updated"}
-    except Exception as e:
-        logger.exception("error during file upload")
-        return JSONResponse(status_code=500,content={"error":str(e)})
-
-@app.post("/ask")
-async def ask_question(question:str=Form(...)):
-    try:
-        logger.info(f"user query:{question}")
-        from langchain_chroma import Chroma
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        from modules.load_vectorstore import PERSIST_DIR
-
-        embeddings = HuggingFaceEmbeddings(
-            model_name=EMBED_MODEL
-        )
-
+        
+        # Reinitialize vectorstore to pick up new documents
         vectorstore = Chroma(
             persist_directory=PERSIST_DIR,
             embedding_function=embeddings,
-            collection_name=COLLECTION_NAME 
+            collection_name=COLLECTION_NAME
         )
+        chain = get_llm_chain(vectorstore)
+        
+        logger.info("Documents added to chroma")
+        return {"message": "Files processed and vectorstore updated"}
+    except Exception as e:
+        logger.exception("Error during file upload")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-        chain=get_llm_chain(vectorstore)
-        result=query_chain(chain,question)
-        logger.info("query successfulyl")
+@app.post("/ask")
+async def ask_question(question: str = Form(...)):
+    global chain
+    try:
+        logger.info(f"User query: {question}")
+        
+        if chain is None:
+            logger.error("Chain not initialized")
+            return JSONResponse(
+                status_code=500, 
+                content={"error": "System not ready. Please upload documents first."}
+            )
+        
+        result = query_chain(chain, question)
+        logger.info("Query successful")
         return result
     except Exception as e:
         logger.error(f"Error in ask_question: {str(e)}")
-        return JSONResponse(status_code=500,content={"error":str(e)})
-
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/reset")
 def reset_chat():
+    global vectorstore, chain
     try:
         logger.info(f"Resetting collection: {COLLECTION_NAME}")
         
@@ -92,6 +127,14 @@ def reset_chat():
             metadata={"hnsw:space": "cosine"}
         )
         logger.info(f"Collection {COLLECTION_NAME} created.")
+        
+        # Reinitialize vectorstore and chain
+        vectorstore = Chroma(
+            persist_directory=PERSIST_DIR,
+            embedding_function=embeddings,
+            collection_name=COLLECTION_NAME
+        )
+        chain = get_llm_chain(vectorstore)
         
         # Optional: Clear uploaded PDFs folder
         import shutil
