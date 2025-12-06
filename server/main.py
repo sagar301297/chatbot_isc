@@ -14,38 +14,10 @@ from logger import logger
 
 from config import PERSIST_DIR, EMBED_MODEL, COLLECTION_NAME
 
-# Import these at startup
-from langchain_chroma import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-
 client = chromadb.PersistentClient(path=PERSIST_DIR)
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
 app = FastAPI(title='chatbot')
-
-# Initialize embeddings and vectorstore at startup
-embeddings = None
-vectorstore = None
-chain = None
-
-@app.on_event("startup")
-async def startup_event():
-    global embeddings, vectorstore, chain
-    logger.info("Initializing embeddings model...")
-    embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-    logger.info("Embeddings model loaded")
-    
-    logger.info("Initializing vectorstore...")
-    vectorstore = Chroma(
-        persist_directory=PERSIST_DIR,
-        embedding_function=embeddings,
-        collection_name=COLLECTION_NAME
-    )
-    logger.info("Vectorstore initialized")
-    
-    # Initialize chain (will be recreated after uploads)
-    chain = get_llm_chain(vectorstore)
-    logger.info("LLM chain ready")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,25 +35,16 @@ async def catch_exception_middleware(request: Request, call_next):
         logger.exception("Exception")
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
+# Add health check to stop the 404 errors
 @app.get("/")
 def health_check():
-    return {"status": "healthy", "vectorstore_initialized": vectorstore is not None}
+    return {"status": "healthy"}
 
 @app.post("/upload_pdfs")
 async def uploaded_pdfs(files: List[UploadFile] = File(...)):
-    global vectorstore, chain
     try:
         logger.info(f"Received {len(files)} files")
         load_vectorstore(files)
-        
-        # Reinitialize vectorstore to pick up new documents
-        vectorstore = Chroma(
-            persist_directory=PERSIST_DIR,
-            embedding_function=embeddings,
-            collection_name=COLLECTION_NAME
-        )
-        chain = get_llm_chain(vectorstore)
-        
         logger.info("Documents added to chroma")
         return {"message": "Files processed and vectorstore updated"}
     except Exception as e:
@@ -90,27 +53,35 @@ async def uploaded_pdfs(files: List[UploadFile] = File(...)):
 
 @app.post("/ask")
 async def ask_question(question: str = Form(...)):
-    global chain
     try:
         logger.info(f"User query: {question}")
         
-        if chain is None:
-            logger.error("Chain not initialized")
-            return JSONResponse(
-                status_code=500, 
-                content={"error": "System not ready. Please upload documents first."}
-            )
+        # Import only when needed (saves memory at startup)
+        from langchain_chroma import Chroma
+        from langchain_community.embeddings import HuggingFaceEmbeddings
         
+        # Initialize embeddings and vectorstore for this request
+        embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
+        
+        vectorstore = Chroma(
+            persist_directory=PERSIST_DIR,
+            embedding_function=embeddings,
+            collection_name=COLLECTION_NAME
+        )
+        
+        chain = get_llm_chain(vectorstore)
         result = query_chain(chain, question)
+        
         logger.info("Query successful")
         return result
+        
     except Exception as e:
         logger.error(f"Error in ask_question: {str(e)}")
+        logger.exception("Full traceback:")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/reset")
 def reset_chat():
-    global vectorstore, chain
     try:
         logger.info(f"Resetting collection: {COLLECTION_NAME}")
         
@@ -127,14 +98,6 @@ def reset_chat():
             metadata={"hnsw:space": "cosine"}
         )
         logger.info(f"Collection {COLLECTION_NAME} created.")
-        
-        # Reinitialize vectorstore and chain
-        vectorstore = Chroma(
-            persist_directory=PERSIST_DIR,
-            embedding_function=embeddings,
-            collection_name=COLLECTION_NAME
-        )
-        chain = get_llm_chain(vectorstore)
         
         # Optional: Clear uploaded PDFs folder
         import shutil
